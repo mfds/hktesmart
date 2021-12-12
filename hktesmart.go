@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/alpr777/homekit"
 	"github.com/brutella/hc"
@@ -14,18 +15,26 @@ import (
 
 type config struct {
 	host         string
+	port         string
 	accessoryPin string
 	dbDir        string
+	inputNames   []string
 }
 
 func getConfig() config {
 	var ok bool
 	var host string
+	var port string
 	var accessoryPin string
 	var dbDir string
+	var inputNames []string
 
 	if host, ok = os.LookupEnv("TESMART_HOST"); !ok {
-		host = "192.168.1.10:5000"
+		host = "192.168.1.10"
+	}
+
+	if port, ok = os.LookupEnv("TESMART_PORT"); !ok {
+		port = "5000"
 	}
 
 	if accessoryPin, ok = os.LookupEnv("TESMART_PIN"); !ok {
@@ -36,25 +45,30 @@ func getConfig() config {
 		dbDir = "./db"
 	}
 
+	if names, ok := os.LookupEnv("TESMART_INPUTS"); !ok {
+		inputNames = make([]string, 16)
+		for i := 0; i < len(inputNames); i++ {
+			inputNames[i] = fmt.Sprintf("HDMI %d", i+1)
+		}
+	} else {
+		inputNames = strings.Split(names, ",")
+	}
+
+	if len(inputNames) != 16 {
+		log.Fatalf("Wrong number of inputs")
+	}
+
 	return config{
 		host:         host,
+		port:         port,
 		accessoryPin: accessoryPin,
 		dbDir:        dbDir,
+		inputNames:   inputNames,
 	}
 }
 
 func main() {
 	c := getConfig()
-
-	t, err := tesmart.NewTesmartSwitch(c.host)
-	if err != nil {
-		log.Panicf("Cannot connect to switch: %v", err)
-	}
-
-	activeInput, err := t.GetCurrentInput()
-	if err != nil {
-		log.Panicf("Cannot get current input: %v", err)
-	}
 
 	accessoryInfo := accessory.Info{
 		Name:             "TESmart 16x1 4K HDMI Switch",
@@ -68,7 +82,11 @@ func main() {
 
 	// Create input sources
 	for i := 1; i <= 16; i++ {
-		acc.AddInputSource(i, fmt.Sprintf("HDMI %d", i), characteristic.InputSourceTypeHdmi)
+		name := c.inputNames[i-1]
+		if name == "" {
+			name = fmt.Sprintf("HDMI %d", i)
+		}
+		acc.AddInputSource(i, name, characteristic.InputSourceTypeHdmi)
 	}
 
 	// Show accessory as always active
@@ -76,9 +94,6 @@ func main() {
 	go acc.Television.Active.OnValueRemoteUpdate(func(v int) {
 		acc.Television.Active.SetValue(1)
 	})
-
-	// Set current active input
-	acc.Television.ActiveIdentifier.SetValue(activeInput)
 
 	// Create transport
 	transportConfig := hc.Config{
@@ -94,15 +109,24 @@ func main() {
 	}
 
 	// Handle responses coming from devices
-	go func() {
-		for {
-			newInput, err := tesmart.ExtractInput(<-t.Responses)
-			if err != nil {
-				log.Panicf("Cannot extract input: %v", err)
-			}
-			acc.Television.ActiveIdentifier.SetValue(newInput)
+	receiverFunc := func(data []byte) {
+		newInput, err := tesmart.ExtractInput(data)
+		if err != nil {
+			log.Printf("Cannot extract input: %v %d", err, int(data[5]-data[4]))
+			return
 		}
-	}()
+		acc.Television.ActiveIdentifier.SetValue(newInput)
+	}
+
+	t, err := tesmart.NewTesmartSwitch(c.host, c.port, receiverFunc)
+	if err != nil {
+		log.Fatalf("Cannot connect to switch: %v", err)
+	}
+
+	err = t.SendGetCurrentInput()
+	if err != nil {
+		log.Fatalf("Cannot get current input: %v", err)
+	}
 
 	// Send command to device
 	go acc.Television.ActiveIdentifier.OnValueRemoteUpdate(func(v int) {
